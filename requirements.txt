@@ -14,11 +14,11 @@ kiwisolver==1.4.9
 markdown-it-py==4.0.0
 matplotlib==3.10.8
 mdurl==0.1.2
--e git+https://github.com/salehmahamathissene/navier-stokes-lab.git@6dd8d6a88690b347589e11892ae14bea9d9244c0
+navier_stokes_lab @ git+https://github.com/salehmahamathissene/navier-stokes-lab.git@6dd8d6a88690b347589e11892ae14bea9d9244c0
 numpy==2.4.2
 packaging==26.0
 pandas==3.0.1
--e git+https://github.com/salehmahamathissene/passenger-impact-engine.git@8623cb8cf1996f93ce9e48ca8b778e36618bccdc
+passenger_impact_engine @ git+https://github.com/salehmahamathissene/passenger-impact-engine.git@8623cb8cf1996f93ce9e48ca8b778e36618bccdc
 pillow==12.1.1
 pydantic==2.12.5
 pydantic_core==2.41.5
