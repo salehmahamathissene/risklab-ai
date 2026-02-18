@@ -7,11 +7,12 @@ from fastapi.responses import FileResponse
 
 from backend.soc.detections import detect_bruteforce
 from backend.soc.report import generate_soc_report
+
 from backend.airline.routes import router as airline_router
+from backend.cfd.routes import router as cfd_router
 
 app = FastAPI(title="RiskLab AI")
 
-# SOC report path
 SOC_REPORT = Path("outputs/reports/soc_report.pdf")
 
 
@@ -27,6 +28,7 @@ async def soc_upload(file: UploadFile):
     lines = content.decode("utf-8", errors="replace").splitlines()
 
     finding = detect_bruteforce(lines)
+    SOC_REPORT.parent.mkdir(parents=True, exist_ok=True)
     generate_soc_report(finding, str(SOC_REPORT))
 
     return {
@@ -47,5 +49,6 @@ def soc_report_latest():
     return FileResponse(str(SOC_REPORT), media_type="application/pdf", filename="soc_report.pdf")
 
 
-# ---------- AIRLINE ----------
+# ---------- Routers ----------
 app.include_router(airline_router)
+app.include_router(cfd_router)
