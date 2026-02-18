@@ -7,10 +7,13 @@ from fastapi.responses import FileResponse
 
 from backend.soc.detections import detect_bruteforce
 from backend.soc.report import generate_soc_report
+from backend.airline.routes import router as airline_router  # ✅ ADD THIS
 
 app = FastAPI(title="RiskLab AI")
 
 LATEST_REPORT = Path("outputs/reports/soc_report.pdf")
+
+app.include_router(airline_router)  # ✅ ADD THIS (after app = FastAPI)
 
 
 @app.get("/")
