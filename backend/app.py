@@ -10,6 +10,16 @@ from backend.soc.report import generate_soc_report
 
 from backend.airline.routes import router as airline_router
 from backend.cfd.routes import router as cfd_router
+from fastapi import Response
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# Optional: Render sometimes sends HEAD /
+@app.head("/")
+def home_head():
+    return Response(status_code=200)
 
 app = FastAPI(title="RiskLab AI")
 
@@ -47,6 +57,10 @@ def soc_report_latest():
     if not SOC_REPORT.exists():
         raise HTTPException(status_code=404, detail="No SOC report yet. Upload a log first.")
     return FileResponse(str(SOC_REPORT), media_type="application/pdf", filename="soc_report.pdf")
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 # ---------- Routers ----------
