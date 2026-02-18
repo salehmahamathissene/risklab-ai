@@ -1,76 +1,69 @@
 from __future__ import annotations
 
 import json
-import sys
+import subprocess
 from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+
+from backend.airline.report import generate_airline_report
 
 router = APIRouter(prefix="/airline", tags=["airline"])
 
-# Add vendored PIE to import path (submodule)
-PIE_ROOT = Path(__file__).resolve().parents[2] / "vendor" / "passenger-impact-engine"
-if PIE_ROOT.exists():
-    sys.path.insert(0, str(PIE_ROOT))
+OUT_DIR = Path("outputs/airline")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+LATEST_STATS = OUT_DIR / "stats.json"
+LATEST_REPORT = OUT_DIR / "airline_report.pdf"
+
+# Your PIE demo config inside the submodule:
+DEMO_CONFIG = Path("vendor/passenger-impact-engine/configs/demo_eu261_realistic.yml")
+
+
+def _run_pie_cli(config_path: Path) -> Dict[str, Any]:
+    if not config_path.exists():
+        raise HTTPException(status_code=500, detail=f"PIE config not found: {config_path}")
+
+    # run PIE and write outputs into outputs/airline/
+    cmd = ["pie", "run-all", "--config", str(config_path), "--out", str(OUT_DIR)]
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="PIE CLI not found. Ensure you installed PIE in the SAME venv: pip install -e vendor/passenger-impact-engine",
+        )
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"PIE CLI failed.\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}",
+        )
+
+    if not LATEST_STATS.exists():
+        raise HTTPException(status_code=500, detail="PIE ran but outputs/airline/stats.json not found.")
+
+    return json.loads(LATEST_STATS.read_text(encoding="utf-8"))
 
 
 @router.get("/run-demo")
 def run_demo() -> Dict[str, Any]:
-    """
-    Try to call PIE's demo runner if available; otherwise return a static demo.
-    """
-    # 1) Try a few common entrypoints safely
-    candidates = [
-        ("pie.api.app", "run_demo"),
-        ("pie.cli", "run_demo"),
-        ("pie.app", "run_demo"),
-    ]
+    stats = _run_pie_cli(DEMO_CONFIG)
+    generate_airline_report(stats, str(LATEST_REPORT))
+    return stats
 
-    for mod, fn in candidates:
-        try:
-            m = __import__(mod, fromlist=[fn])
-            f = getattr(m, fn)
-            out = f()
 
-            # If PIE returns a JSON string, parse it
-            if isinstance(out, str):
-                try:
-                    return json.loads(out)
-                except Exception:
-                    return {"raw": out}
+@router.get("/stats/latest")
+def stats_latest():
+    if not LATEST_STATS.exists():
+        raise HTTPException(status_code=404, detail="No airline stats yet. Call /airline/run-demo first.")
+    return json.loads(LATEST_STATS.read_text(encoding="utf-8"))
 
-            # If PIE returns dict already
-            if isinstance(out, dict):
-                return out
 
-            return {"result": out}
-        except Exception:
-            continue
-
-    # 2) Fallback: static demo (always works)
-    return {
-        "carrier": "DemoAir",
-        "flight": "DA123",
-        "event": "delay",
-        "delay_min": 190,
-        "passengers": 180,
-        "currency": "EUR",
-        "mode": "Monte Carlo",
-        "n_sim": 5000,
-        "expected_exposure": 104890,
-        "expected_eu261": 73959,
-        "expected_ops": 30931,
-        "p50": 109067,
-        "p95": 114670,
-        "quantiles": {
-            "q10": 77523,
-            "q25": 105650,
-            "q50": 109067,
-            "q75": 111482,
-            "q90": 113527,
-            "q95": 114670,
-            "q99": 116772,
-        },
-        "note": "PIE entrypoint not found yet; returned static demo.",
-    }
+@router.get("/report/latest")
+def report_latest():
+    if not LATEST_REPORT.exists():
+        raise HTTPException(status_code=404, detail="No airline report yet. Call /airline/run-demo first.")
+    return FileResponse(str(LATEST_REPORT), media_type="application/pdf", filename="airline_report.pdf")
