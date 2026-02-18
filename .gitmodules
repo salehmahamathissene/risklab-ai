@@ -1,3 +1,6 @@
 [submodule "vendor/passenger-impact-engine"]
 	path = vendor/passenger-impact-engine
 	url = https://github.com/salehmahamathissene/passenger-impact-engine.git
+[submodule "vendor/navier-stokes-lab"]
+	path = vendor/navier-stokes-lab
+	url = https://github.com/salehmahamathissene/navier-stokes-lab.git
