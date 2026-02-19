@@ -14,7 +14,7 @@ kiwisolver==1.4.9
 markdown-it-py==4.0.0
 matplotlib==3.10.8
 mdurl==0.1.2
-navier-stokes-lab @ git+https://github.com/salehmahamathissene/navier-stokes-lab.git@6e2cc8329f3f2ff6c8350e6306f75b3384eecb64
+navier-stokes-lab @ git+https://github.com/salehmahamathissene/navier-stokes-lab.git@PASTE_NEW_SHA_HERE
 numpy==2.4.2
 packaging==26.0
 pandas==3.0.1
