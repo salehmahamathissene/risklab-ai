@@ -10,11 +10,11 @@ from fastapi import APIRouter, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.soc import detections, report
-from backend.soc.detections import SOCFinding  # important
+from backend.soc.detections import SOCFinding
 
 router = APIRouter(prefix="/soc", tags=["soc"])
 
-ROUTES_VERSION = "soc-2026-02-19-UPGRADED"
+ROUTES_VERSION = "soc-2026-02-19-STABLE"
 
 # Render writable
 OUT_DIR = Path("/tmp/risklab")
@@ -23,17 +23,26 @@ LATEST_PDF = OUT_DIR / "soc_report.pdf"
 
 
 def _looks_like_finding(obj: Any) -> bool:
+    # Strong check
     if isinstance(obj, SOCFinding):
         return True
-    # report expects f.severity
+    # Fallback: report expects f.severity
     return hasattr(obj, "severity")
 
 
 def _flatten_findings(x: Any) -> list[Any]:
-    """Normalize ANY detector output into a flat list of findings objects."""
+    """
+    Normalize ANY detector output into a flat list of finding objects.
+
+    Handles:
+      - None
+      - single SOCFinding
+      - list/tuple (including nested)
+      - dict payload like {"findings":[...]} or {"results":[...]}
+    """
     out: list[Any] = []
 
-    def walk(v: Any):
+    def walk(v: Any) -> None:
         if v is None:
             return
 
@@ -53,6 +62,7 @@ def _flatten_findings(x: Any) -> list[Any]:
             out.append(v)
             return
 
+        # ignore anything else (strings, counters, metadata, etc.)
         return
 
     walk(x)
@@ -70,20 +80,6 @@ def _finding_to_dict(f: Any) -> dict:
 
 
 def _call_generate_soc_report(findings: list[Any], out_path: Path) -> Path:
-# Defensive: flatten nested lists/tuples so report never crashes
-flat = []
-for item in findings or []:
-    if isinstance(item, (list, tuple)):
-        flat.extend(item)
-    else:
-        flat.append(item)
-findings = flat
-
-for f in findings:
-    if isinstance(f, (list, tuple)):
-        continue
-    # drawString(... f.severity ...)
-
     """
     Calls report.generate_soc_report flexibly:
       - generate_soc_report(findings, out_path=Path)
@@ -96,6 +92,7 @@ for f in findings:
     params = list(sig.parameters.values())
 
     kwargs: dict[str, Any] = {}
+
     for p in params:
         if p.name in ("out_path", "path", "output_path", "pdf_path", "dest", "dst"):
             kwargs[p.name] = out_path
