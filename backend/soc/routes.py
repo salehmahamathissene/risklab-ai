@@ -14,7 +14,7 @@ from backend.soc import detections, report
 
 router = APIRouter(prefix="/soc", tags=["soc"])
 
-ROUTES_VERSION = "soc-2026-02-19-v4"
+ROUTES_VERSION = "soc-2026-02-19-v5-19da57b"
 
 # On Render, /tmp is writable.
 OUT_DIR = Path("/tmp/risklab")
