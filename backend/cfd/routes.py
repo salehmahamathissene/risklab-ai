@@ -1,80 +1,106 @@
 from __future__ import annotations
 
-from pathlib import Path
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/cfd", tags=["cfd"])
 
-# Render-safe writable dir
-OUT_DIR = Path("/tmp/risklab_cfd")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-SPEED = OUT_DIR / "cavity_fast_speed.png"
-VORT  = OUT_DIR / "cavity_fast_vorticity.png"
-
-
-def _run_cmd(cmd: list[str], timeout_s: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+# One shared output directory for BOTH:
+# - the runner writes images here
+# - /cfd/file/{name} serves files from here
+CFD_OUT_DIR = Path(os.environ.get("CFD_OUT_DIR", "/tmp/cfd")).resolve()
+CFD_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _run_cavity_fast() -> None:
-    # Always use the current interpreter on Render
+@router.get("/cavity-fast")
+def cavity_fast():
+    """
+    Run a fast lid-driven cavity simulation and write:
+      - cavity_fast_speed.png
+      - cavity_fast_vorticity.png
+    into CFD_OUT_DIR
+    """
+
     cmd = [
         sys.executable,
         "-m",
         "navier_stokes_lab.scripts.run_cavity_fast",
         "--out",
-        str(OUT_DIR),
-        "--nx",
+        str(CFD_OUT_DIR),
+        "--n",
         "64",
-        "--ny",
-        "64",
-        "--steps",
-        "200",
+        "--re",
+        "1000",
         "--dt",
         "0.005",
+        "--t-end",
+        "0.5",
     ]
 
-    p = _run_cmd(cmd, timeout_s=120)
-
-    if p.returncode != 0:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
         raise HTTPException(
-            500,
-            "CFD run failed.\n"
-            f"CMD: {' '.join(cmd)}\n\n"
-            f"STDOUT:\n{p.stdout}\n\n"
-            f"STDERR:\n{p.stderr}\n"
+            status_code=500,
+            detail=(
+                "CFD run failed.\n"
+                f"CMD: {' '.join(cmd)}\n\n"
+                f"STDOUT:\n{e.stdout}\n\n"
+                f"STDERR:\n{e.stderr}\n"
+            ),
+        )
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"CFD run timed out after {e.timeout}s.",
         )
 
-    if not SPEED.exists() or not VORT.exists():
-        raise HTTPException(500, f"CFD run finished but expected outputs not found in {OUT_DIR}")
+    speed = CFD_OUT_DIR / "cavity_fast_speed.png"
+    vort = CFD_OUT_DIR / "cavity_fast_vorticity.png"
 
+    if not speed.exists() or not vort.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "CFD run finished but expected files were not found.\n"
+                f"Expected:\n- {speed}\n- {vort}\n\n"
+                f"STDOUT:\n{proc.stdout}\n\n"
+                f"STDERR:\n{proc.stderr}\n"
+            ),
+        )
 
-@router.get("/cavity-fast")
-def cavity_fast():
-    _run_cavity_fast()
     return {
         "ok": True,
-        "outputs": {
-            "speed_png": "/cfd/file/cavity_fast_speed.png",
-            "vorticity_png": "/cfd/file/cavity_fast_vorticity.png",
-        },
+        "out_dir": str(CFD_OUT_DIR),
+        "files": [
+            "cavity_fast_speed.png",
+            "cavity_fast_vorticity.png",
+        ],
+        "stdout_tail": proc.stdout.splitlines()[-20:],
     }
 
 
 @router.get("/file/{name}")
 def get_file(name: str):
-    allowed = {
-        "cavity_fast_speed.png": SPEED,
-        "cavity_fast_vorticity.png": VORT,
-    }
-    path = allowed.get(name)
-    if path is None:
-        raise HTTPException(404, "Unknown file name.")
+    """
+    Serve any file from CFD_OUT_DIR.
+    """
+    from fastapi.responses import FileResponse
+
+    path = (CFD_OUT_DIR / name).resolve()
+    if not str(path).startswith(str(CFD_OUT_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid path.")
     if not path.exists():
-        raise HTTPException(404, "File not generated yet. Call /cfd/cavity-fast first.")
-    return FileResponse(str(path), media_type="image/png", filename=name)
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    return FileResponse(path)
