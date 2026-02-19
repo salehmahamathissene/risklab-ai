@@ -1,73 +1,47 @@
-from __future__ import annotations
-
 from pathlib import Path
-import importlib
-import traceback
-
+import subprocess
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/cfd", tags=["cfd"])
 
-ROOT = Path(__file__).resolve().parents[2]  # repo root
-OUTDIR = ROOT / "outputs" / "cfd"
-OUTDIR.mkdir(parents=True, exist_ok=True)
+OUT_DIR = Path("outputs")
+OUT_DIR.mkdir(exist_ok=True)
 
-SPEED = OUTDIR / "cavity_fast_speed.png"
-VORT = OUTDIR / "cavity_fast_vorticity.png"
+SPEED = OUT_DIR / "cavity_fast_speed.png"
+VORT  = OUT_DIR / "cavity_fast_vorticity.png"
 
+def _run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
 
-def _try_run_from_package() -> None:
-    """
-    Preferred: run CFD by importing navier_stokes_lab.
-    This avoids vendor submodules and works on Render.
-    """
-    try:
-        # You will create this module/function in navier-stokes-lab repo
-        mod = importlib.import_module("navier_stokes_lab.scripts.run_cavity_fast")
-    except Exception:
+def _run_cavity_fast() -> None:
+    # Try a few likely module entrypoints
+    candidates = [
+        ["python", "-m", "navier_stokes_lab.scripts.run_cavity_fast", "--out", str(OUT_DIR)],
+        ["python", "-m", "navier_stokes_lab.run_cavity_fast", "--out", str(OUT_DIR)],
+        ["python", "-m", "navier_stokes_lab.cavity_fast", "--out", str(OUT_DIR)],
+    ]
+
+    last = None
+    for cmd in candidates:
+        p = _run_cmd(cmd)
+        last = p
+        if p.returncode == 0:
+            break
+
+    if last is None or last.returncode != 0:
         raise HTTPException(
-            status_code=500,
-            detail=(
-                "CFD package not importable yet.\n"
-                "Expected module: navier_stokes_lab.scripts.run_cavity_fast\n\n"
-                "Fix: update navier-stokes-lab packaging to include src/navier_stokes_lab/...\n"
-                f"Import error:\n{traceback.format_exc()}"
-            ),
-        )
-
-    # Convention: module provides main(outdir=Path)
-    if not hasattr(mod, "main"):
-        raise HTTPException(
-            status_code=500,
-            detail="navier_stokes_lab.scripts.run_cavity_fast has no main(outdir=Path) function.",
-        )
-
-    try:
-        mod.main(outdir=OUTDIR)  # type: ignore[attr-defined]
-    except TypeError:
-        # fallback if function signature is main() and writes internally
-        mod.main()  # type: ignore[attr-defined]
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail=f"CFD run failed inside navier_stokes_lab.\n{traceback.format_exc()}",
+            500,
+            "CFD run failed. Your navier-stokes-lab package needs a runnable module.\n"
+            f"STDOUT:\n{(last.stdout if last else '')}\n\nSTDERR:\n{(last.stderr if last else '')}"
         )
 
     if not SPEED.exists() or not VORT.exists():
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "CFD run completed but PNG outputs not found.\n"
-                f"Expected:\n- {SPEED}\n- {VORT}\n"
-                "Ensure run_cavity_fast writes these filenames into the outdir."
-            ),
-        )
-
+        raise HTTPException(500, "CFD run completed but PNG outputs not found in outputs/.")
 
 @router.get("/cavity-fast")
 def cavity_fast():
-    _try_run_from_package()
+    _run_cavity_fast()
     return {
         "ok": True,
         "outputs": {
@@ -75,7 +49,6 @@ def cavity_fast():
             "vorticity_png": "/cfd/file/cavity_fast_vorticity.png",
         },
     }
-
 
 @router.get("/file/{name}")
 def get_file(name: str):
@@ -85,7 +58,7 @@ def get_file(name: str):
     }
     path = allowed.get(name)
     if path is None:
-        raise HTTPException(status_code=404, detail="Unknown file name.")
+        raise HTTPException(404, "Unknown file name.")
     if not path.exists():
-        raise HTTPException(status_code=404, detail="File not generated yet. Call /cfd/cavity-fast first.")
+        raise HTTPException(404, "File not generated yet. Call /cfd/cavity-fast first.")
     return FileResponse(str(path), media_type="image/png", filename=name)
