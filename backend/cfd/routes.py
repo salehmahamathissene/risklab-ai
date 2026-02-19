@@ -6,6 +6,57 @@ import sys
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
+import time
+
+
+@router.get("/cavity-fast/view", response_class=HTMLResponse)
+def cavity_fast_view():
+    """
+    Runs cavity-fast and displays results in browser.
+    """
+
+    # Run simulation first
+    cavity_fast()
+
+    ts = int(time.time())
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>CFD Cavity Fast</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #111;
+                color: white;
+                text-align: center;
+            }}
+            img {{
+                max-width: 600px;
+                border: 2px solid #444;
+                margin: 20px;
+            }}
+            h1 {{
+                color: #00ffcc;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>🚀 Lid-Driven Cavity Simulation</h1>
+        <p>Grid: 64 × 64 | Re = 1000 | t_end = 0.5</p>
+
+        <h2>Velocity Magnitude</h2>
+        <img src="/cfd/file/cavity_fast_speed.png?ts={ts}" />
+
+        <h2>Vorticity</h2>
+        <img src="/cfd/file/cavity_fast_vorticity.png?ts={ts}" />
+
+        <p>Auto-generated at {ts}</p>
+    </body>
+    </html>
+    """
 
 router = APIRouter(prefix="/cfd", tags=["cfd"])
 
