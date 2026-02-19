@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 
-from .detections import analyze_log  # adjust if your function name differs
-from .report import render_soc_pdf   # adjust if your function name differs
+# IMPORTANT: adjust these imports to your real function names
+from .detections import analyze_log
+from .report import render_soc_pdf
 
 router = APIRouter(prefix="/soc", tags=["soc"])
 
@@ -18,18 +19,18 @@ async def soc_upload(file: UploadFile = File(...)):
     raw = await file.read()
     text = raw.decode("utf-8", errors="ignore")
 
-    result = analyze_log(text)  # returns dict summary
+    result = analyze_log(text)  # dict
 
-    pdf_bytes = render_soc_pdf(result)  # returns bytes OR writes file (depends on your implementation)
+    pdf_bytes = render_soc_pdf(result)  # bytes (recommended)
+    if not isinstance(pdf_bytes, (bytes, bytearray)):
+        raise HTTPException(status_code=500, detail="render_soc_pdf must return PDF bytes.")
 
-    # If render_soc_pdf returns bytes:
-    if isinstance(pdf_bytes, (bytes, bytearray)):
-        LATEST_PDF.write_bytes(pdf_bytes)
+    LATEST_PDF.write_bytes(pdf_bytes)
 
     return {**result, "report_url": "/soc/report/latest"}
 
 @router.get("/report/latest")
 def soc_report_latest():
     if not LATEST_PDF.exists():
-        return {"detail": "No SOC report yet. POST /soc/upload first."}
+        raise HTTPException(status_code=404, detail="No SOC report yet. POST /soc/upload first.")
     return FileResponse(str(LATEST_PDF), media_type="application/pdf", filename="soc_report.pdf")
