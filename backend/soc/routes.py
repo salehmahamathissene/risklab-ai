@@ -3,6 +3,27 @@ from __future__ import annotations
 from pathlib import Path
 import inspect
 import traceback
+from dataclasses import asdict, is_dataclass
+from typing import Any
+
+def _as_findings_list(x: Any):
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, tuple):
+        return list(x)
+    # single finding object (dataclass or normal)
+    return [x]
+
+def _finding_to_dict(f):
+    if is_dataclass(f):
+        return asdict(f)
+    if hasattr(f, "dict") and callable(getattr(f, "dict")):
+        return f.dict()
+    if hasattr(f, "model_dump") and callable(getattr(f, "model_dump")):
+        return f.model_dump()
+    return {"text": str(f)}
 
 from fastapi import APIRouter, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
