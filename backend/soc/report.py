@@ -1,75 +1,96 @@
-# backend/soc/report.py
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Iterable
 
-from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
-from backend.soc.detections import SOCFinding
+
+def _safe_str(x: Any) -> str:
+    try:
+        return str(x)
+    except Exception:
+        return "<unprintable>"
 
 
-def generate_soc_report(f: SOCFinding, out_path: str) -> str:
-# Defensive flatten (prevents list.severity forever)
-flat = []
-for item in findings or []:
-    if isinstance(item, (list, tuple)):
-        flat.extend(item)
-    else:
-        flat.append(item)
-findings = flat
+def _flatten_findings(findings: Any) -> list[Any]:
+    """
+    Defensive flatten:
+    - Accept None / single object / list / nested lists
+    - Return ONLY objects that look like findings (have .severity or at least some text)
+    """
+    out: list[Any] = []
 
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-
-    c = canvas.Canvas(out_path, pagesize=letter)
-    w, h = letter
-
-    y = h - 60
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, y, "RiskLab AI — SOC Incident Report")
-    y -= 25
-
-    c.setFont("Helvetica", 10)
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    c.drawString(50, y, f"Generated: {ts} (UTC)")
-    y -= 20
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y, f"Severity: {f.severity}")
-    y -= 20
-
-    c.setFont("Helvetica", 11)
-    c.drawString(50, y, f"Summary: {f.summary}")
-    y -= 25
-
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(50, y, "Key Metrics")
-    y -= 18
-    c.setFont("Helvetica", 11)
-    c.drawString(60, y, f"Total failed logins: {f.total_failed}")
-    y -= 16
-    c.drawString(60, y, f"Unique source IPs: {f.unique_ips}")
-    y -= 24
-
-    def draw_list(title: str, items: list[tuple[str, int]]):
-        nonlocal y
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, y, title)
-        y -= 18
-        c.setFont("Helvetica", 11)
-        if not items:
-            c.drawString(60, y, "None")
-            y -= 16
+    def walk(v: Any) -> None:
+        if v is None:
             return
-        for k, v in items:
-            c.drawString(60, y, f"{k}  —  {v}")
-            y -= 16
+        if isinstance(v, dict):
+            # common wrappers
+            for k in ("findings", "alerts", "items", "events", "results"):
+                if k in v:
+                    walk(v[k])
+                    return
+            return
+        if isinstance(v, (list, tuple)):
+            for it in v:
+                walk(it)
+            return
+        # single item
+        out.append(v)
 
-    draw_list("Top attacker IPs", f.top_ips)
-    y -= 10
-    draw_list("Top targeted usernames", f.top_users)
+    walk(findings)
+    return out
 
-    c.showPage()
+
+def generate_soc_report(findings: Any, out_path: str | Path = "/tmp/risklab/soc_report.pdf") -> Path:
+    """
+    Generate a PDF SOC report.
+    - NEVER crashes if findings contain nested lists or weird types.
+    - Writes to out_path and returns Path.
+    """
+    out_path = Path(out_path)
+
+    # --- CRITICAL: must be inside function (indented) ---
+    findings_list = _flatten_findings(findings)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    c = canvas.Canvas(str(out_path))
+    y = 800
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, "SOC Report")
+    y -= 30
+
+    c.setFont("Helvetica", 12)
+
+    if not findings_list:
+        c.drawString(50, y, "No findings detected.")
+        c.save()
+        return out_path
+
+    for f in findings_list:
+        # Skip if f is still a list/tuple (shouldn't happen, but safe)
+        if isinstance(f, (list, tuple)):
+            continue
+
+        # Defensive fields
+        severity = getattr(f, "severity", "UNKNOWN")
+        title = getattr(f, "title", None) or getattr(f, "name", None) or "Finding"
+        desc = getattr(f, "description", None) or getattr(f, "text", None) or _safe_str(f)
+
+        c.drawString(50, y, f"Severity: {severity}")
+        y -= 16
+        c.drawString(50, y, f"Title: {title}")
+        y -= 16
+        c.drawString(50, y, f"Details: {desc[:140]}")
+        y -= 24
+
+        # New page if needed
+        if y < 80:
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y = 800
+
     c.save()
     return out_path
