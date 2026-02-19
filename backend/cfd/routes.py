@@ -3,60 +3,11 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
-import time
-
-
-@router.get("/cavity-fast/view", response_class=HTMLResponse)
-def cavity_fast_view():
-    """
-    Runs cavity-fast and displays results in browser.
-    """
-
-    # Run simulation first
-    cavity_fast()
-
-    ts = int(time.time())
-
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>CFD Cavity Fast</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #111;
-                color: white;
-                text-align: center;
-            }}
-            img {{
-                max-width: 600px;
-                border: 2px solid #444;
-                margin: 20px;
-            }}
-            h1 {{
-                color: #00ffcc;
-            }}
-        </style>
-    </head>
-    <body>
-        <h1>🚀 Lid-Driven Cavity Simulation</h1>
-        <p>Grid: 64 × 64 | Re = 1000 | t_end = 0.5</p>
-
-        <h2>Velocity Magnitude</h2>
-        <img src="/cfd/file/cavity_fast_speed.png?ts={ts}" />
-
-        <h2>Vorticity</h2>
-        <img src="/cfd/file/cavity_fast_vorticity.png?ts={ts}" />
-
-        <p>Auto-generated at {ts}</p>
-    </body>
-    </html>
-    """
+from fastapi.responses import FileResponse, HTMLResponse
 
 router = APIRouter(prefix="/cfd", tags=["cfd"])
 
@@ -146,12 +97,107 @@ def get_file(name: str):
     """
     Serve any file from CFD_OUT_DIR.
     """
-    from fastapi.responses import FileResponse
-
     path = (CFD_OUT_DIR / name).resolve()
+
+    # prevent path traversal
     if not str(path).startswith(str(CFD_OUT_DIR)):
         raise HTTPException(status_code=400, detail="Invalid path.")
     if not path.exists():
         raise HTTPException(status_code=404, detail="Not found.")
 
-    return FileResponse(path)
+    # Optional: hint browsers/CDNs to not cache
+    # (querystring ts already busts cache, but this helps too)
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+    return FileResponse(path, headers=headers)
+
+
+@router.get("/cavity-fast/view", response_class=HTMLResponse)
+def cavity_fast_view():
+    """
+    Runs cavity-fast and displays results in browser.
+    """
+
+    # Run simulation first (same code path as API)
+    cavity_fast()
+
+    ts = int(time.time())
+
+    return HTMLResponse(
+        f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8"/>
+            <title>CFD Cavity Fast</title>
+            <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+            <meta http-equiv="Pragma" content="no-cache" />
+            <meta http-equiv="Expires" content="0" />
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    background: #111;
+                    color: white;
+                    text-align: center;
+                    margin: 0;
+                    padding: 24px;
+                }}
+                .wrap {{
+                    max-width: 980px;
+                    margin: 0 auto;
+                }}
+                img {{
+                    width: 100%;
+                    max-width: 820px;
+                    border: 2px solid #444;
+                    border-radius: 10px;
+                    margin: 14px 0 30px 0;
+                }}
+                h1 {{ color: #00ffcc; margin-bottom: 8px; }}
+                .meta {{ color: #bbb; margin-bottom: 18px; }}
+                .btn {{
+                    display: inline-block;
+                    padding: 10px 14px;
+                    border: 1px solid #444;
+                    border-radius: 10px;
+                    color: #fff;
+                    text-decoration: none;
+                    margin: 8px;
+                }}
+                .btn:hover {{ border-color: #00ffcc; }}
+                code {{
+                    background: #222;
+                    padding: 2px 6px;
+                    border-radius: 6px;
+                    color: #ddd;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="wrap">
+                <h1>🚀 Lid-Driven Cavity Simulation</h1>
+                <div class="meta">
+                    Grid: <code>64×64</code> | Re: <code>1000</code> | dt: <code>0.005</code> | t_end: <code>0.5</code>
+                    <br/>Generated at: <code>{ts}</code>
+                </div>
+
+                <div>
+                    <a class="btn" href="/cfd/cavity-fast/view">🔁 Run again</a>
+                    <a class="btn" href="/cfd/cavity-fast">📦 JSON output</a>
+                </div>
+
+                <h2>Velocity Magnitude</h2>
+                <img src="/cfd/file/cavity_fast_speed.png?ts={ts}" />
+
+                <h2>Vorticity</h2>
+                <img src="/cfd/file/cavity_fast_vorticity.png?ts={ts}" />
+
+            </div>
+        </body>
+        </html>
+        """
+    )
