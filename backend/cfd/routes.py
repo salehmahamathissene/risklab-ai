@@ -2,6 +2,11 @@ from pathlib import Path
 import subprocess
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+import sys  # add this
+
+candidates = [
+    [sys.executable, "-m", "navier_stokes_lab.scripts.run_cavity_fast", "--out", str(OUT_DIR)],
+]
 
 router = APIRouter(prefix="/cfd", tags=["cfd"])
 
