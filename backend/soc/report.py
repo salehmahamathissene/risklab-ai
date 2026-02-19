@@ -11,6 +11,15 @@ from backend.soc.detections import SOCFinding
 
 
 def generate_soc_report(f: SOCFinding, out_path: str) -> str:
+# Defensive flatten (prevents list.severity forever)
+flat = []
+for item in findings or []:
+    if isinstance(item, (list, tuple)):
+        flat.extend(item)
+    else:
+        flat.append(item)
+findings = flat
+
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     c = canvas.Canvas(out_path, pagesize=letter)
