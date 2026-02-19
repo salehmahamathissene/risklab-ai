@@ -1,4 +1,5 @@
 from __future__ import annotations
+from backend.soc.detections import SOCFinding
 
 from pathlib import Path
 import inspect
@@ -151,3 +152,35 @@ def soc_report_latest():
         media_type="application/pdf",
         filename="soc_report.pdf",
     )
+def _looks_like_finding(obj: Any) -> bool:
+    if isinstance(obj, SOCFinding):
+        return True
+    return hasattr(obj, "severity")
+
+def _flatten_findings(x: Any) -> list[Any]:
+    out: list[Any] = []
+
+    def walk(v: Any):
+        if v is None:
+            return
+
+        if isinstance(v, dict):
+            for key in ("findings", "alerts", "items", "events", "results"):
+                if key in v:
+                    walk(v[key])
+                    return
+            return
+
+        if isinstance(v, (list, tuple)):
+            for it in v:
+                walk(it)
+            return
+
+        if _looks_like_finding(v):
+            out.append(v)
+            return
+
+        return
+
+    walk(x)
+    return out
