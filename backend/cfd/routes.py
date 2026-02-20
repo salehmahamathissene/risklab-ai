@@ -5,39 +5,37 @@ import hashlib
 import hmac
 import json
 import os
-import subprocess
-import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+import redis
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+
+from backend.core.config import settings
+from backend.cfd.pro_models import get_db, ProCustomer, CFDJob
+from backend.worker import make_queue, run_cfd_job
 
 # =========================
-# Router (DEFINE FIRST!)
+# Router
 # =========================
 router = APIRouter(prefix="/cfd", tags=["cfd"])
 
-# Shared output root
 CFD_OUT_DIR = Path(os.environ.get("CFD_OUT_DIR", "/tmp/cfd")).resolve()
 CFD_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# =========================
-# Pro auth (NO DB NEEDED)
-# =========================
-# Set these in Render environment:
-#   PRO_SIGNING_KEY = long random string
-# Optional:
-#   PRO_STATIC_KEY = some key you can give manually to paying users (fallback)
-PRO_SIGNING_KEY = os.environ.get("PRO_SIGNING_KEY", "")
-PRO_STATIC_KEY = os.environ.get("PRO_STATIC_KEY", "")
-
 COOKIE_NAME = "risklab_pro"
 
+FREE_LIMITS = {"n_max": 64, "t_end_max": 0.5}
+PRO_LIMITS = {"n_max": 256, "t_end_max": 10.0}
 
+
+# =========================
+# Pro token (cookie) with customer_id
+# =========================
 def _b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
 
@@ -47,65 +45,58 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
-def issue_pro_token(ttl_days: int = 30) -> str:
-    if not PRO_SIGNING_KEY:
-        # Token system disabled until you set PRO_SIGNING_KEY
+def issue_pro_token(customer_id: str, ttl_days: int = 30) -> str:
+    if not settings.pro_signing_key:
         return ""
     now = int(time.time())
     exp = now + ttl_days * 24 * 3600
-    payload = {"exp": exp, "iat": now}
+    payload = {"exp": exp, "iat": now, "cid": customer_id}
     payload_b = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_s = _b64url(payload_b)
 
-    sig = hmac.new(PRO_SIGNING_KEY.encode("utf-8"), payload_s.encode("utf-8"), hashlib.sha256).digest()
+    sig = hmac.new(settings.pro_signing_key.encode("utf-8"), payload_s.encode("utf-8"), hashlib.sha256).digest()
     sig_s = _b64url(sig)
     return f"{payload_s}.{sig_s}"
 
 
-def verify_pro_token(token: str) -> bool:
-    if not token or not PRO_SIGNING_KEY:
-        return False
+def verify_pro_token(token: str) -> Optional[str]:
+    if not token or not settings.pro_signing_key:
+        return None
     try:
         payload_s, sig_s = token.split(".", 1)
-        expected = hmac.new(PRO_SIGNING_KEY.encode("utf-8"), payload_s.encode("utf-8"), hashlib.sha256).digest()
+        expected = hmac.new(settings.pro_signing_key.encode("utf-8"), payload_s.encode("utf-8"), hashlib.sha256).digest()
         if not hmac.compare_digest(_b64url(expected), sig_s):
-            return False
+            return None
         payload = json.loads(_b64url_decode(payload_s).decode("utf-8"))
         exp = int(payload.get("exp", 0))
-        return int(time.time()) < exp
+        if int(time.time()) >= exp:
+            return None
+        cid = payload.get("cid")
+        return str(cid) if cid else None
     except Exception:
-        return False
+        return None
 
 
-def is_pro(request: Request) -> bool:
-    # 1) cookie token
+def is_pro(request: Request, db) -> bool:
+    # 1) cookie token -> DB check
     tok = request.cookies.get(COOKIE_NAME, "")
-    if verify_pro_token(tok):
-        return True
+    cid = verify_pro_token(tok)
+    if cid:
+        row = db.get(ProCustomer, cid)
+        if row and row.active:
+            return True
 
-    # 2) header key (for API customers / internal testing)
+    # 2) header fallback (optional)
     hdr = request.headers.get("X-Pro-Key", "")
-    if PRO_STATIC_KEY and hdr and hmac.compare_digest(hdr, PRO_STATIC_KEY):
+    if settings.pro_static_key and hdr and hmac.compare_digest(hdr, settings.pro_static_key):
         return True
 
     return False
 
 
-# =========================
-# Limits (FREE vs PRO)
-# =========================
-FREE_LIMITS = {
-    "n_max": 64,
-    "t_end_max": 0.5,
-}
-PRO_LIMITS = {
-    "n_max": 256,
-    "t_end_max": 10.0,
-}
-
-
-def enforce_limits(request: Request, n: int, t_end: float) -> None:
-    limits = PRO_LIMITS if is_pro(request) else FREE_LIMITS
+def enforce_limits(request: Request, db, n: int, t_end: float) -> bool:
+    pro = is_pro(request, db)
+    limits = PRO_LIMITS if pro else FREE_LIMITS
     if n > limits["n_max"] or t_end > limits["t_end_max"]:
         raise HTTPException(
             status_code=402,
@@ -116,40 +107,12 @@ def enforce_limits(request: Request, n: int, t_end: float) -> None:
                 "requested": {"n": n, "t_end": t_end},
             },
         )
+    return pro
 
 
-# =========================
-# Helpers
-# =========================
 def make_job_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"cfd_{ts}_{uuid.uuid4().hex[:6]}"
-
-
-def run_cavity_fast(job_dir: Path, n: int, re: float, dt: float, t_end: float) -> subprocess.CompletedProcess[str]:
-    cmd = [
-        sys.executable,
-        "-m",
-        "navier_stokes_lab.scripts.run_cavity_fast",
-        "--out",
-        str(job_dir),
-        "--n",
-        str(n),
-        "--re",
-        str(re),
-        "--dt",
-        str(dt),
-        "--t-end",
-        str(t_end),
-    ]
-
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=180,
-    )
 
 
 def tail_lines(s: str, k: int = 30) -> list[str]:
@@ -158,66 +121,70 @@ def tail_lines(s: str, k: int = 30) -> list[str]:
 
 
 # =========================
-# API: run -> JSON
+# API: create job (fast)
 # =========================
 @router.get("/cavity-fast")
 def cavity_fast(
     request: Request,
+    db=Depends(get_db),
     n: int = 64,
     re: float = 1000.0,
     dt: float = 0.005,
     t_end: float = 0.5,
 ) -> Dict[str, Any]:
     """
-    Run lid-driven cavity and write images into /tmp/cfd/<job_id>/...
-    Returns JSON with view link + file links.
+    Production: creates job + enqueues to worker (does NOT run CFD inside request)
     """
-    enforce_limits(request, n=n, t_end=t_end)
+    pro = enforce_limits(request, db, n=n, t_end=t_end)
 
     job_id = make_job_id()
-    job_dir = (CFD_OUT_DIR / job_id).resolve()
-    job_dir.mkdir(parents=True, exist_ok=True)
+    params = {"n": n, "re": re, "dt": dt, "t_end": t_end}
 
-    try:
-        proc = run_cavity_fast(job_dir, n=n, re=re, dt=dt, t_end=t_end)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "CFD run failed.\n"
-                f"STDOUT:\n{e.stdout}\n\n"
-                f"STDERR:\n{e.stderr}\n"
-            ),
-        )
-    except subprocess.TimeoutExpired as e:
-        raise HTTPException(status_code=504, detail=f"CFD run timed out after {e.timeout}s.")
+    row = CFDJob(
+        job_id=job_id,
+        status="queued",
+        pro=pro,
+        params_json=json.dumps(params, separators=(",", ":")),
+        output_dir=str((CFD_OUT_DIR / job_id).resolve()),
+    )
+    db.add(row)
+    db.commit()
 
-    speed = job_dir / "cavity_fast_speed.png"
-    vort = job_dir / "cavity_fast_vorticity.png"
-
-    if not speed.exists() or not vort.exists():
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "CFD finished but output files missing.\n"
-                f"Expected:\n- {speed}\n- {vort}\n\n"
-                f"STDOUT:\n{proc.stdout}\n\n"
-                f"STDERR:\n{proc.stderr}\n"
-            ),
-        )
+    # enqueue background job
+    q = make_queue()
+    q.enqueue(run_cfd_job, job_id, job_timeout=900)  # 15 min
 
     return {
         "ok": True,
-        "pro": is_pro(request),
+        "pro": pro,
         "job_id": job_id,
-        "params": {"n": n, "re": re, "dt": dt, "t_end": t_end},
+        "params": params,
+        "status_url": f"/cfd/jobs/{job_id}",
         "view_url": f"/cfd/jobs/{job_id}/view",
         "report_url": f"/cfd/jobs/{job_id}/report.pdf",
         "files": {
             "speed": f"/cfd/jobs/{job_id}/file/cavity_fast_speed.png",
             "vorticity": f"/cfd/jobs/{job_id}/file/cavity_fast_vorticity.png",
         },
-        "stdout_tail": tail_lines(proc.stdout, 20),
+        "hint": "Poll status_url until status=='done', then open view_url.",
+    }
+
+
+@router.get("/jobs/{job_id}")
+def job_status(job_id: str, db=Depends(get_db)) -> Dict[str, Any]:
+    row = db.get(CFDJob, job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {
+        "job_id": row.job_id,
+        "status": row.status,
+        "pro": row.pro,
+        "created_at": row.created_at.isoformat(),
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+        "error": row.error,
+        "view_url": f"/cfd/jobs/{job_id}/view",
+        "report_url": f"/cfd/jobs/{job_id}/report.pdf",
     }
 
 
@@ -225,11 +192,8 @@ def cavity_fast(
 # UI: landing page
 # =========================
 @router.get("/cavity-fast/view", response_class=HTMLResponse)
-def cavity_fast_view(request: Request) -> str:
-    """
-    Browser UI with form + run button (no JS frameworks).
-    """
-    pro = is_pro(request)
+def cavity_fast_view(request: Request, db=Depends(get_db)) -> str:
+    pro = is_pro(request, db)
     limits = PRO_LIMITS if pro else FREE_LIMITS
 
     return f"""<!DOCTYPE html>
@@ -289,7 +253,7 @@ def cavity_fast_view(request: Request) -> str:
         </div>
 
         <div style="margin-top:12px; display:flex; gap:10px; align-items:center;">
-          <button type="submit">▶ Run (JSON)</button>
+          <button type="submit">▶ Create Job (JSON)</button>
           <a class="small" href="/cfd/cavity-fast">Use defaults</a>
           <a class="small" href="/cfd/pro">Pro status</a>
           <a class="small" href="/cfd/billing">Upgrade</a>
@@ -297,7 +261,7 @@ def cavity_fast_view(request: Request) -> str:
       </form>
 
       <div class="warn" style="margin-top:14px;">
-        <b>Tip:</b> After you run, open the <b>view_url</b> from the JSON to see images + download PDF.
+        <b>Tip:</b> After you run, poll <b>status_url</b> until <b>done</b>, then open <b>view_url</b>.
       </div>
     </div>
 
@@ -307,7 +271,7 @@ def cavity_fast_view(request: Request) -> str:
         <li>Higher grid resolution (up to n={PRO_LIMITS['n_max']})</li>
         <li>Longer simulation (up to t_end={PRO_LIMITS['t_end_max']})</li>
         <li>PDF report download per run</li>
-        <li>No caching issues (fresh results per Job ID)</li>
+        <li>Background worker (no timeouts)</li>
       </ul>
     </div>
   </div>
@@ -316,16 +280,13 @@ def cavity_fast_view(request: Request) -> str:
 """
 
 
-# =========================
-# Pro status endpoint
-# =========================
 @router.get("/pro")
-def pro_status(request: Request) -> Dict[str, Any]:
+def pro_status(request: Request, db=Depends(get_db)) -> Dict[str, Any]:
     return {
-        "pro": is_pro(request),
+        "pro": is_pro(request, db),
         "free_limits": FREE_LIMITS,
         "pro_limits": PRO_LIMITS,
-        "hint": "To enable Pro: set PRO_SIGNING_KEY and use /cfd/billing (Stripe) or X-Pro-Key header (PRO_STATIC_KEY).",
+        "hint": "Real Pro comes from Stripe webhooks -> DB active. Cookie alone is not enough.",
     }
 
 
@@ -333,10 +294,21 @@ def pro_status(request: Request) -> Dict[str, Any]:
 # Job view page
 # =========================
 @router.get("/jobs/{job_id}/view", response_class=HTMLResponse)
-def job_view(job_id: str) -> str:
-    job_dir = (CFD_OUT_DIR / job_id).resolve()
-    if not job_dir.exists():
+def job_view(job_id: str, db=Depends(get_db)) -> str:
+    row = db.get(CFDJob, job_id)
+    if not row:
         raise HTTPException(status_code=404, detail="Job not found.")
+
+    if row.status != "done":
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>CFD Job {job_id}</title></head>
+<body style="font-family:Arial;background:#0b0f14;color:#e8eef6;padding:30px;">
+  <h1>⏳ Job not ready</h1>
+  <p><b>Job:</b> {job_id}</p>
+  <p><b>Status:</b> {row.status}</p>
+  <p><a href="/cfd/jobs/{job_id}" style="color:#7dd3fc;">Check JSON status</a></p>
+  <p>Refresh this page after status becomes <b>done</b>.</p>
+</body></html>"""
 
     ts = int(time.time())
     speed = f"/cfd/jobs/{job_id}/file/cavity_fast_speed.png?ts={ts}"
@@ -368,7 +340,7 @@ def job_view(job_id: str) -> str:
 
       <div class="row" style="margin-top:12px;">
         <a href="/cfd/cavity-fast/view"><button class="secondary">⬅ Back</button></a>
-        <a href="/cfd/cavity-fast"><button class="secondary">📦 JSON output</button></a>
+        <a href="/cfd/jobs/{job_id}"><button class="secondary">📦 JSON status</button></a>
         <a href="{report}"><button>📄 Download PDF report</button></a>
       </div>
     </div>
@@ -388,12 +360,12 @@ def job_view(job_id: str) -> str:
 """
 
 
-# =========================
-# Serve job files (NO CACHE)
-# =========================
 @router.get("/jobs/{job_id}/file/{name}")
-def job_file(job_id: str, name: str):
-    job_dir = (CFD_OUT_DIR / job_id).resolve()
+def job_file(job_id: str, name: str, db=Depends(get_db)):
+    row = db.get(CFDJob, job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    job_dir = Path(row.output_dir or (CFD_OUT_DIR / job_id)).resolve()
     path = (job_dir / name).resolve()
 
     if not str(path).startswith(str(job_dir)):
@@ -401,29 +373,24 @@ def job_file(job_id: str, name: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Not found.")
 
-    # Force browser to always fetch latest
-    headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
-    }
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"}
     return FileResponse(path, headers=headers)
 
 
-# =========================
-# PDF report per job
-# =========================
 @router.get("/jobs/{job_id}/report.pdf")
-def job_report(job_id: str):
+def job_report(job_id: str, db=Depends(get_db)):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.units import inch
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
 
-    job_dir = (CFD_OUT_DIR / job_id).resolve()
-    if not job_dir.exists():
+    row = db.get(CFDJob, job_id)
+    if not row:
         raise HTTPException(status_code=404, detail="Job not found.")
+    if row.status != "done":
+        raise HTTPException(status_code=409, detail="Job not done yet.")
 
+    job_dir = Path(row.output_dir or (CFD_OUT_DIR / job_id)).resolve()
     speed = job_dir / "cavity_fast_speed.png"
     vort = job_dir / "cavity_fast_vorticity.png"
     if not speed.exists() or not vort.exists():
@@ -441,7 +408,6 @@ def job_report(job_id: str):
     c.drawString(1 * inch, h - 1.25 * inch, f"Job ID: {job_id}")
     c.drawString(1 * inch, h - 1.40 * inch, f"Generated: {datetime.now(timezone.utc).isoformat()}")
 
-    # Put images (scaled)
     y = h - 2.0 * inch
     img_w = 6.8 * inch
     img_h = 3.0 * inch
@@ -469,11 +435,11 @@ def job_report(job_id: str):
 
 
 # =========================
-# Billing UI (upgrade page)
+# Billing UI
 # =========================
 @router.get("/billing", response_class=HTMLResponse)
-def billing_page(request: Request) -> str:
-    pro = is_pro(request)
+def billing_page(request: Request, db=Depends(get_db)) -> str:
+    pro = is_pro(request, db)
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -498,23 +464,17 @@ def billing_page(request: Request) -> str:
     </div>
 
     <div class="card">
-      <h3>Option A (FAST): Manual Pro key</h3>
-      <p>Set <code>PRO_STATIC_KEY</code> in Render env and give paying users a key.
-      They call API with header <code>X-Pro-Key: &lt;key&gt;</code>.</p>
-    </div>
-
-    <div class="card">
-      <h3>Option B (REAL PAYMENTS): Stripe Checkout</h3>
-      <p>Enable Stripe env vars and use endpoint <code>/cfd/stripe/checkout</code>.</p>
+      <h3>Real payments (Stripe Subscription)</h3>
       <ul>
         <li><code>STRIPE_SECRET_KEY</code></li>
-        <li><code>STRIPE_PRICE_ID</code> (your Pro subscription price)</li>
-        <li><code>PRO_SIGNING_KEY</code> (for Pro cookie tokens)</li>
-        <li><code>PUBLIC_BASE_URL</code> (e.g. https://risklab-ai-1.onrender.com)</li>
+        <li><code>STRIPE_PRICE_ID</code></li>
+        <li><code>STRIPE_WEBHOOK_SECRET</code></li>
+        <li><code>PRO_SIGNING_KEY</code></li>
+        <li><code>PUBLIC_BASE_URL</code> (https://risklab-ai-1.onrender.com)</li>
       </ul>
       <p><a href="/cfd/stripe/checkout"><button>Pay with Stripe</button></a></p>
       <div style="opacity:0.8; font-size:13px;">
-        After payment, server sets a Pro cookie and you become PRO automatically.
+        Pro is activated only after Stripe verification + DB update.
       </div>
     </div>
   </div>
@@ -524,27 +484,18 @@ def billing_page(request: Request) -> str:
 
 
 # =========================
-# Stripe checkout (optional)
+# Stripe checkout: redirect to Stripe
 # =========================
 @router.get("/stripe/checkout")
 def stripe_checkout():
-    """
-    Creates a Stripe Checkout session. Requires stripe package + env vars.
-    """
-    secret = os.environ.get("STRIPE_SECRET_KEY", "")
-    price_id = os.environ.get("STRIPE_PRICE_ID", "")
-    base = os.environ.get("PUBLIC_BASE_URL", "")
+    secret = settings.stripe_secret_key or ""
+    price_id = settings.stripe_price_id or ""
+    base = settings.public_base_url or ""
 
     if not secret or not price_id or not base:
-        raise HTTPException(
-            status_code=501,
-            detail="Stripe not configured. Set STRIPE_SECRET_KEY, STRIPE_PRICE_ID, PUBLIC_BASE_URL.",
-        )
+        raise HTTPException(501, "Stripe not configured. Set STRIPE_SECRET_KEY, STRIPE_PRICE_ID, PUBLIC_BASE_URL.")
 
-    try:
-        import stripe  # type: ignore
-    except Exception:
-        raise HTTPException(status_code=500, detail="stripe package not installed. Add stripe to requirements.txt")
+    import stripe  # type: ignore
 
     stripe.api_key = secret
 
@@ -557,21 +508,49 @@ def stripe_checkout():
         success_url=success_url,
         cancel_url=cancel_url,
     )
-
-    # Redirect user to Stripe checkout URL
-    return {"checkout_url": session.url}
+    return RedirectResponse(session.url, status_code=303)
 
 
+# =========================
+# Stripe success: VERIFY session before cookie
+# =========================
 @router.get("/stripe/success", response_class=HTMLResponse)
-def stripe_success(session_id: str, response: Response):
-    """
-    After successful payment, set Pro cookie.
-    You can also verify the session with Stripe here (recommended).
-    """
-    # Minimal: issue token (best: verify with Stripe session first)
-    token = issue_pro_token(ttl_days=30)
+def stripe_success(session_id: str, response: Response, db=Depends(get_db)):
+    if not settings.stripe_secret_key:
+        raise HTTPException(501, "Stripe not configured")
+
+    import stripe  # type: ignore
+
+    stripe.api_key = settings.stripe_secret_key
+
+    # Verify the checkout session
+    sess = stripe.checkout.Session.retrieve(session_id, expand=["subscription", "customer"])
+    sub = sess.get("subscription")
+    cust = sess.get("customer")
+
+    # subscription must be active/trialing
+    status = getattr(sub, "status", None) if sub else None
+    if status not in ("active", "trialing"):
+        raise HTTPException(403, f"Subscription not active (status={status}).")
+
+    customer_id = str(cust)
+    subscription_id = getattr(sub, "id", None) if sub else None
+
+    # Update DB: mark as active
+    row = db.get(ProCustomer, customer_id)
+    if not row:
+        row = ProCustomer(customer_id=customer_id, subscription_id=subscription_id, active=True)
+        db.add(row)
+    else:
+        row.subscription_id = subscription_id
+        row.active = True
+        row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # Issue cookie tied to customer id (DB is source of truth)
+    token = issue_pro_token(customer_id=customer_id, ttl_days=30)
     if not token:
-        raise HTTPException(status_code=500, detail="PRO_SIGNING_KEY not set; cannot issue Pro token cookie.")
+        raise HTTPException(500, "PRO_SIGNING_KEY not set; cannot issue Pro cookie.")
 
     response.set_cookie(
         key=COOKIE_NAME,
@@ -582,11 +561,62 @@ def stripe_success(session_id: str, response: Response):
         max_age=30 * 24 * 3600,
     )
 
-    return f"""<!DOCTYPE html>
+    return """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Pro Activated</title></head>
 <body style="font-family:Arial;background:#0b0f14;color:#e8eef6;padding:30px;">
   <h1>✅ Pro activated</h1>
-  <p>Your Pro access cookie has been set.</p>
+  <p>Your subscription is verified and Pro is enabled.</p>
   <p><a href="/cfd/cavity-fast/view" style="color:#7dd3fc;">Go run higher resolution CFD</a></p>
 </body></html>
 """
+
+
+# =========================
+# Stripe webhook: SOURCE OF TRUTH
+# =========================
+@router.post("/stripe/webhook")
+async def stripe_webhook(request: Request, db=Depends(get_db)):
+    if not settings.stripe_secret_key or not settings.stripe_webhook_secret:
+        raise HTTPException(501, "Webhook not configured")
+
+    import stripe  # type: ignore
+
+    stripe.api_key = settings.stripe_secret_key
+
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, settings.stripe_webhook_secret)
+    except Exception:
+        raise HTTPException(400, "Invalid webhook signature")
+
+    et = event["type"]
+    obj = event["data"]["object"]
+
+    def _set_customer(customer_id: str, subscription_id: Optional[str], active: bool):
+        row = db.get(ProCustomer, customer_id)
+        if not row:
+            row = ProCustomer(customer_id=customer_id, subscription_id=subscription_id, active=active)
+            db.add(row)
+        else:
+            row.subscription_id = subscription_id or row.subscription_id
+            row.active = active
+            row.updated_at = datetime.now(timezone.utc)
+        db.commit()
+
+    # Activate on paid signals
+    if et in ("checkout.session.completed", "invoice.paid"):
+        customer_id = str(obj.get("customer"))
+        sub_id = obj.get("subscription")
+        if customer_id:
+            _set_customer(customer_id, str(sub_id) if sub_id else None, True)
+
+    # Deactivate on cancel/failure
+    if et in ("customer.subscription.deleted", "invoice.payment_failed"):
+        customer_id = str(obj.get("customer"))
+        sub_id = obj.get("id") or obj.get("subscription")
+        if customer_id:
+            _set_customer(customer_id, str(sub_id) if sub_id else None, False)
+
+    return {"ok": True, "event": et}
